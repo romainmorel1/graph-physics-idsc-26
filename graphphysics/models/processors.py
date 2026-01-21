@@ -2,11 +2,15 @@ import torch
 import torch.nn as nn
 from torch_geometric.data import Data
 
+# from graphphysics.models.layers import (
+#     GraphNetBlock,
+#     build_mlp,
+# )
+
 from graphphysics.models.layers import (
-    GraphNetBlock,
+    SparseEdgeAttentionBlock,
     build_mlp,
 )
-
 
 class EncodeProcessDecode(nn.Module):
     """
@@ -64,9 +68,15 @@ class EncodeProcessDecode(nn.Module):
                 layer_norm=False,
             )
 
+        # self.processor_list = nn.ModuleList(
+        #     [GraphNetBlock(hidden_size=hidden_size) for _ in range(message_passing_num)]
+        # )
+
+
         self.processor_list = nn.ModuleList(
-            [GraphNetBlock(hidden_size=hidden_size) for _ in range(message_passing_num)]
-        )
+        [SparseEdgeAttentionBlock(hidden_size=hidden_size) for _ in range(message_passing_num)]
+    )
+
 
     def forward(self, graph: Data) -> torch.Tensor:
         """

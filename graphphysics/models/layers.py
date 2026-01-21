@@ -4,6 +4,7 @@ from typing import Any, Dict, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 from torch_geometric.nn import MessagePassing
+from torch_geometric.utils import softmax
 
 
 class RMSNorm(nn.Module):
@@ -430,3 +431,82 @@ class GraphNetBlock(MessagePassing):
         node_input = torch.cat([x, aggr_out], dim=-1)
         x = self.node_block(node_input)
         return x
+
+
+
+class SparseEdgeAttentionBlock(MessagePassing):
+    """
+    Sparse attention over existing edges using PyG's MessagePassing aggregation (no torch_scatter import).
+    Same interface as GraphNetBlock: returns (x, edge_attr).
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        nb_of_layers: int = 4,
+        layer_norm: bool = True,
+        edge_bias: bool = True,
+        dropout: float = 0.0,
+    ):
+        super().__init__(aggr="add", flow="source_to_target")
+        self.hidden_size = hidden_size
+        self.scale = 1.0 / math.sqrt(hidden_size)
+
+        self.W_q = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.W_k = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.W_v = nn.Linear(hidden_size, hidden_size, bias=False)
+
+        self.edge_bias = edge_bias
+        self.W_e = nn.Linear(hidden_size, 1, bias=False) if edge_bias else None
+        self.attn_drop = nn.Dropout(dropout)
+
+        self.node_block = build_mlp(
+            in_size=2 * hidden_size,
+            hidden_size=hidden_size,
+            out_size=hidden_size,
+            nb_of_layers=nb_of_layers,
+            layer_norm=layer_norm,
+        )
+
+        # Optionnel: edge update résiduel (comme GraphNetBlock)
+        self.edge_block = build_mlp(
+            in_size=3 * hidden_size,
+            hidden_size=hidden_size,
+            out_size=hidden_size,
+            nb_of_layers=nb_of_layers,
+            layer_norm=layer_norm,
+        )
+
+    def forward(self, x: torch.Tensor, edge_index: torch.Tensor, edge_attr: torch.Tensor):
+        # 1) Edge update résiduel (optionnel mais souvent utile)
+        row, col = edge_index  # row=src (j), col=dst (i)
+        edge_update = self.edge_block(torch.cat([edge_attr, x[col], x[row]], dim=-1))
+        edge_attr = edge_attr + edge_update
+
+        # 2) Propagate attention-weighted messages using PyG aggregation
+        out = self.propagate(edge_index, x=x, edge_attr=edge_attr, size=(x.size(0), x.size(0)))
+
+        # 3) Node residual update
+        x_update = self.node_block(torch.cat([x, out], dim=-1))
+        x = x + x_update
+
+        return x, edge_attr
+
+    def message(self, x_i: torch.Tensor, x_j: torch.Tensor, edge_attr: torch.Tensor, index: torch.Tensor):
+        """
+        x_i: features of target nodes for each edge [E, H]
+        x_j: features of source nodes for each edge [E, H]
+        index: target node indices (same as col) [E]
+        """
+        q_i = self.W_q(x_i)
+        k_j = self.W_k(x_j)
+        v_j = self.W_v(x_j)
+
+        logits = (q_i * k_j).sum(dim=-1) * self.scale  # [E]
+        if self.edge_bias:
+            logits = logits + self.W_e(edge_attr).squeeze(-1)  # [E]
+
+        alpha = softmax(logits, index)  # softmax per target node
+        alpha = self.attn_drop(alpha)
+
+        return v_j * alpha.unsqueeze(-1)  # [E, H] Correction
