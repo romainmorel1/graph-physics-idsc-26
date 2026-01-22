@@ -115,6 +115,134 @@ def build_mlp(
 
     return nn.Sequential(*layers)
 
+def keeptopk(tensor: torch.Tensor, k):
+    """Keeps the top-k values in the last dimension of the tensor."""
+    topk_values, topk_indices = torch.topk(tensor, k, dim=-1)
+    mask = (- torch.ones_like(tensor) * torch.inf).scatter_(-1, topk_indices, 0)
+    return tensor + mask
+
+class MoE(nn.Module):
+    """
+    Mixture of Experts (MoE) Layer.
+
+    This layer consists of multiple expert networks and a gating mechanism
+    to combine their outputs.
+    """
+
+    def __init__(
+        self,
+        in_size: int,
+        hidden_size: int,
+        out_size: int,
+        num_experts: int,
+        num_top_experts: int,
+        nb_of_layers: int = 2,
+        layer_norm: bool = True,
+        act: str = "relu",
+    ):
+        """
+        Initializes the MoE layer.
+
+        Args:
+            in_size (int): Size of the input features.
+            hidden_size (int): Size of the hidden layers in each expert.
+            out_size (int): Size of the output features.
+            num_experts (int): Number of expert networks.
+            nb_of_layers (int, optional): Number of layers in each expert network.
+                Defaults to 2.
+            layer_norm (bool, optional): Whether to apply RMS normalization to the
+                output layer. Defaults to True.
+            act (str, optional): Activation function to use ('relu' or 'gelu').
+                Defaults to 'relu'.
+        """
+        super().__init__()
+
+        self.num_experts = num_experts
+        self.num_top_experts = num_top_experts
+        self.experts = nn.ModuleList(
+            [
+                build_mlp(
+                    in_size=in_size,
+                    hidden_size=hidden_size,
+                    out_size=out_size,
+                    nb_of_layers=nb_of_layers,
+                    layer_norm=layer_norm,
+                    act=act,
+                )
+                for _ in range(num_experts)
+            ]
+        )
+
+        # Define the gate as in the paper "Outrageously Large Neural Networks"
+        
+        self.gate_layer = nn.Linear(in_size, num_experts, bias=False)
+        self.noise_layer = nn.Linear(in_size, num_experts, bias=False)
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Forward pass of the MoE layer.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (..., in_size).
+
+        Returns:
+            tuple[torch.Tensor, torch.Tensor]: A tuple containing:
+                - output (torch.Tensor): Output tensor of shape (..., out_size).
+                - CV (torch.Tensor): Coefficient of variation of expert importance.
+        """
+        gate_logits = self.gate_layer(x)
+        gate_logits = gate_logits + torch.randn(()) * torch.nn.functional.softplus(self.noise_layer(x))  # Shape: (..., num_experts)
+        gate_logits = keeptopk(gate_logits, self.num_top_experts) # Keep top-k logits
+        gate_weights = torch.softmax(gate_logits, dim=-1)  # Shape: (..., num_experts)
+
+        importance = gate_weights.sum(dim=0)  # Shape: (num_experts,)
+        CV = torch.std(importance) / (torch.mean(importance) + 1e-10)
+
+        expert_outputs = torch.stack(
+            [expert(x) for expert in self.experts], dim=-2
+        )  # Shape: (..., num_experts, out_size)
+
+        # Weighted sum of expert outputs
+        output = expert_outputs * gate_weights.unsqueeze(-1) # Shape: (..., num_experts, out_size)
+        output = output.sum(dim=-2)  # Shape: (..., out_size)
+        return output, CV
+
+
+def build_moe(
+    in_size: int,
+    hidden_size: int,
+    out_size: int,
+    num_experts: int = 6,
+    num_top_experts: int = 2,
+    nb_of_layers: int = 2,
+    layer_norm: bool = True,
+) -> nn.Module:
+    """
+    Builds a Mixture of Experts (MoE) layer.
+
+    Args:
+        in_size (int): Size of the input features.
+        hidden_size (int): Size of the hidden layers in each expert.
+        out_size (int): Size of the output features.
+        num_experts (int): Number of expert networks.
+        nb_of_layers (int, optional): Number of layers in each expert network.
+            Defaults to 2.
+        layer_norm (bool, optional): Whether to apply RMS normalization to the
+            output layer. Defaults to True.
+
+    Returns:
+        nn.Module: The constructed MoE model.
+    """
+    return MoE(
+        in_size=in_size,
+        hidden_size=hidden_size,
+        out_size=out_size,
+        num_experts=num_experts,
+        num_top_experts=num_top_experts,
+        nb_of_layers=nb_of_layers,
+        layer_norm=layer_norm,
+    )
+
 
 class GatedMLP(nn.Module):
     """
@@ -320,7 +448,7 @@ class GraphNetBlock(MessagePassing):
     """
 
     def __init__(
-        self, hidden_size: int, nb_of_layers: int = 4, layer_norm: bool = True
+        self, hidden_size: int, nb_of_layers: int = 2, layer_norm: bool = True
     ):
         """
         Initializes the GraphNetBlock.
@@ -328,21 +456,22 @@ class GraphNetBlock(MessagePassing):
         Args:
             hidden_size (int): The size of the hidden representations.
             nb_of_layers (int, optional): The number of layers in the MLPs.
-                Defaults to 4.
+                Defaults to 3.
             layer_norm (bool, optional): Whether to use layer normalization in the MLPs.
                 Defaults to True.
+            num_experts (int, optional): Number of experts in the MoE layers. Defaults to 6.
         """
         super().__init__(aggr="add", flow="source_to_target")
         edge_input_dim = 3 * hidden_size
         node_input_dim = 2 * hidden_size
-        self.edge_block = build_mlp(
+        self.edge_block = build_moe(
             in_size=edge_input_dim,
             hidden_size=hidden_size,
             out_size=hidden_size,
             nb_of_layers=nb_of_layers,
             layer_norm=layer_norm,
         )
-        self.node_block = build_mlp(
+        self.node_block = build_moe(
             in_size=node_input_dim,
             hidden_size=hidden_size,
             out_size=hidden_size,
@@ -356,7 +485,7 @@ class GraphNetBlock(MessagePassing):
         edge_index: torch.Tensor,
         edge_attr: torch.Tensor,
         size: int = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, dict]:
         """
         Forward pass of the GraphNetBlock.
 
@@ -368,27 +497,27 @@ class GraphNetBlock(MessagePassing):
                 Defaults to None.
 
         Returns:
-            Tuple[torch.Tensor, torch.Tensor]: Updated node features and edge features.
+            Tuple[torch.Tensor, torch.Tensor, dict]: Updated node features, edge features, and CV terms dict.
         """
         # Update edge attributes
         row, col = edge_index
         x_i = x[col]  # Target node features
         x_j = x[row]  # Source node features
-        edge_attr_ = self.edge_update(edge_attr, x_i, x_j)
+        edge_attr_, edge_cv = self.edge_update(edge_attr, x_i, x_j)
 
         # Perform message passing and update node features
-        x_ = self.propagate(
+        x_, node_cv = self.propagate(
             edge_index, x=x, edge_attr=edge_attr_, size=(x.size(0), x.size(0))
         )
 
         edge_attr = edge_attr + edge_attr_
         x = x + x_
 
-        return x, edge_attr
+        return x, edge_attr, {"edge_cv": edge_cv, "node_cv": node_cv}
 
     def edge_update(
         self, edge_attr: torch.Tensor, x_i: torch.Tensor, x_j: torch.Tensor
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Updates edge features.
 
@@ -398,11 +527,11 @@ class GraphNetBlock(MessagePassing):
             x_j (torch.Tensor): Source node features [num_edges, hidden_size].
 
         Returns:
-            torch.Tensor: Updated edge features [num_edges, hidden_size].
+            tuple[torch.Tensor, torch.Tensor]: Updated edge features and CV term.
         """
         edge_input = torch.cat([edge_attr, x_i, x_j], dim=-1)
-        edge_attr = self.edge_block(edge_input)
-        return edge_attr
+        edge_attr, edge_cv = self.edge_block(edge_input)
+        return edge_attr, edge_cv
 
     def message(self, edge_attr: torch.Tensor) -> torch.Tensor:
         """
@@ -416,7 +545,7 @@ class GraphNetBlock(MessagePassing):
         """
         return edge_attr
 
-    def update(self, aggr_out: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    def update(self, aggr_out: torch.Tensor, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Updates node features after aggregation.
 
@@ -425,8 +554,8 @@ class GraphNetBlock(MessagePassing):
             x (torch.Tensor): Node features [num_nodes, hidden_size].
 
         Returns:
-            torch.Tensor: Updated node features [num_nodes, hidden_size].
+            tuple[torch.Tensor, torch.Tensor]: Updated node features and CV term.
         """
         node_input = torch.cat([x, aggr_out], dim=-1)
-        x = self.node_block(node_input)
-        return x
+        x, node_cv = self.node_block(node_input)
+        return x, node_cv

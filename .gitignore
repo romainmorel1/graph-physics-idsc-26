@@ -8,3 +8,5 @@ wandb/
 
 copy.sh
 job.sh
+
+*.ipynb

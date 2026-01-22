@@ -68,7 +68,7 @@ class EncodeProcessDecode(nn.Module):
             [GraphNetBlock(hidden_size=hidden_size) for _ in range(message_passing_num)]
         )
 
-    def forward(self, graph: Data) -> torch.Tensor:
+    def forward(self, graph: Data) -> tuple[torch.Tensor, list]:
         """
         Forward pass of the EncodeProcessDecode model.
 
@@ -76,7 +76,7 @@ class EncodeProcessDecode(nn.Module):
             graph (Data): Input graph data containing 'x' (node features), 'edge_index', and 'edge_attr'.
 
         Returns:
-            Tuple[torch.Tensor, torch.Tensor]: Updated node features and edge features.
+            tuple[torch.Tensor, list]: The output tensor and a list of CV terms from each block.
                 If 'only_processor' is False, the node features are passed through the decoder before returning.
         """
         edge_index = graph.edge_index
@@ -87,11 +87,13 @@ class EncodeProcessDecode(nn.Module):
             x = self.nodes_encoder(graph.x)
             edge_attr = self.edges_encoder(graph.edge_attr)
 
+        cv_terms = []
         for block in self.processor_list:
-            x, edge_attr = block(x, edge_index, edge_attr)
+            x, edge_attr, cv_dict = block(x, edge_index, edge_attr)
+            cv_terms.append(cv_dict)
 
         if self.only_processor:
-            return x
+            return x, cv_terms
         else:
             x_decoded = self.decode_module(x)
-            return x_decoded
+            return x_decoded, cv_terms

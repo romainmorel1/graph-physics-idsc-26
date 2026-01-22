@@ -192,7 +192,7 @@ class Simulator(nn.Module):
 
     def forward(
         self, inputs: Data
-    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], list]:
         """
         Forward pass of the Simulator module.
 
@@ -204,17 +204,18 @@ class Simulator(nn.Module):
                 - network_output (torch.Tensor): The network's output.
                 - target_delta_normalized (torch.Tensor): The normalized target delta.
                 - outputs (torch.Tensor, optional): The reconstructed outputs (only during evaluation).
+                - cv_terms (list): List of CV terms from each MoE block.
         """
         graph, target_delta_normalized = self._build_input_graph(
             inputs=inputs, is_training=self.training
         )
-        network_output = self.model(graph)
+        network_output, cv_terms = self.model(graph)
 
         if self.training:
-            return network_output, target_delta_normalized, None
+            return network_output, target_delta_normalized, None, cv_terms
         else:
             outputs = self.build_outputs(inputs=inputs, network_output=network_output)
-            return network_output, target_delta_normalized, outputs
+            return network_output, target_delta_normalized, outputs, cv_terms
 
     def freeze_all(self) -> None:
         """

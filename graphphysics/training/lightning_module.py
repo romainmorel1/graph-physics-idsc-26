@@ -74,7 +74,7 @@ class LightningModule(L.LightningModule):
 
         self.model = get_simulator(param=parameters, model=processor, device=device)
 
-        self.loss = L2Loss()
+        self.loss = L2Loss(cv_weight=0.05)
 
         self.loss_masks = masks
 
@@ -112,14 +112,14 @@ class LightningModule(L.LightningModule):
     def training_step(self, batch: Batch):
         batch = batch.to(self.device, non_blocking=True)
         node_type = batch.x[:, self.model.node_type_index]
-        network_output, target_delta_normalized, _ = self.model(batch)
+        network_output, target_delta_normalized, _, cv_terms = self.model(batch)
 
         loss = self.loss(
-            graph=batch,
             target=target_delta_normalized,
             network_output=network_output,
             node_type=node_type,
             masks=self.loss_masks,
+            cv_terms=cv_terms,
         )
 
         self.log(
@@ -193,7 +193,7 @@ class LightningModule(L.LightningModule):
         ]
 
         with torch.no_grad():
-            _, _, predicted_outputs = self.model(batch)
+            _, _, predicted_outputs, _ = self.model(batch)
 
         # Apply mask to predicted outputs and update the last prediction
         predicted_outputs[mask] = target[mask]
@@ -233,10 +233,11 @@ class LightningModule(L.LightningModule):
         self.val_step_outputs.append(predicted_outputs.cpu())
         self.val_step_targets.append(target.cpu())
         val_loss = self.loss(
-            target,
-            predicted_outputs,
-            node_type,
+            target=predicted_outputs,
+            network_output=predicted_outputs,
+            node_type=node_type,
             masks=self.loss_masks,
+            cv_terms=None,
         )
         self.log("val_loss", val_loss, on_step=True, on_epoch=True, prog_bar=True)
 
