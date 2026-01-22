@@ -7,8 +7,12 @@ from torch_geometric.data import Data
 #     build_mlp,
 # )
 
+# from graphphysics.models.layers import (
+#     SparseEdgeAttentionBlock,
+#     build_mlp,
+# )
 from graphphysics.models.layers import (
-    SparseEdgeAttentionBlock,
+    SparseNodeAttentionBlock,
     build_mlp,
 )
 
@@ -73,9 +77,14 @@ class EncodeProcessDecode(nn.Module):
         # )
 
 
+        #     self.processor_list = nn.ModuleList(
+        #     [SparseEdgeAttentionBlock(hidden_size=hidden_size) for _ in range(message_passing_num)]
+        # )
+        
         self.processor_list = nn.ModuleList(
-        [SparseEdgeAttentionBlock(hidden_size=hidden_size) for _ in range(message_passing_num)]
-    )
+            [SparseNodeAttentionBlock(hidden_size=hidden_size) for _ in range(message_passing_num)]
+        )
+    
 
 
     def forward(self, graph: Data) -> torch.Tensor:
