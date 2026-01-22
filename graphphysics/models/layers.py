@@ -526,15 +526,8 @@ class SparseEdgeAttentionBlock(MessagePassing):
 
 class SparseNodeAttentionBlock(nn.Module):
     """
-    Sparse Node Attention Block utilisant dgl.sparse.
-    
-    Architecture :
-    1. Node Attention : Calcul des scores via SDDMM (Sampled-Dense-Dense MM).
-    2. Node Aggregation : Somme pondérée via SpMM (Sparse-Dense MM).
-    3. Node Update : MLP sur les nœuds.
-    4. Edge Update : MLP sur les arêtes (basé sur les nœuds mis à jour).
-    
-    Complexité : O(|E|) grâce aux opérateurs sparse.
+    Sparse Node Attention Block compatible avec l'input standard de PyTorch Geometric.
+    Convertit automatiquement edge_index en dgl.sparse.SparseMatrix.
     """
 
     def __init__(
@@ -554,19 +547,15 @@ class SparseNodeAttentionBlock(nn.Module):
         self.edge_bias = edge_bias
         self.scale = 1.0 / math.sqrt(hidden_size)
 
-        # --- Partie 1 : Projections Node-to-Node ---
         self.W_q = nn.Linear(hidden_size, hidden_size, bias=False)
         self.W_k = nn.Linear(hidden_size, hidden_size, bias=False)
         self.W_v = nn.Linear(hidden_size, hidden_size, bias=False)
 
-        # Projection optionnelle pour que l'arête influence le score d'attention
         if self.edge_bias:
             self.W_e = nn.Linear(hidden_size, 1, bias=False)
 
         self.attn_dropout = nn.Dropout(dropout)
 
-        # --- Partie 2 : Node Update ---
-        # Input: [x_old, x_aggregated]
         self.node_block = build_mlp(
             in_size=2 * hidden_size,
             hidden_size=hidden_size,
@@ -575,8 +564,6 @@ class SparseNodeAttentionBlock(nn.Module):
             layer_norm=layer_norm,
         )
 
-        # --- Partie 3 : Edge Update ---
-        # Input: [edge_attr, x_src_new, x_dst_new]
         self.edge_block = build_mlp(
             in_size=3 * hidden_size,
             hidden_size=hidden_size,
@@ -588,84 +575,67 @@ class SparseNodeAttentionBlock(nn.Module):
     def forward(
         self, 
         x: torch.Tensor, 
-        edge_attr: torch.Tensor, 
-        adj: SparseMatrix
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        edge_index: torch.Tensor, 
+        edge_attr: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
-            x (Tensor): Features des nœuds [N, hidden_size]
-            edge_attr (Tensor): Features des arêtes [E, hidden_size]
-            adj (SparseMatrix): Matrice d'adjacence sparse DGL [N, N] (contient la structure du graphe)
+            x: Node features [N, H]
+            edge_index: Graph connectivity (COO format) [2, E]
+            edge_attr: Edge features [E, H]
         """
-        
-        # -----------------------------------------------------------
-        # 1. Calcul de l'Attention (Node-Driven)
-        # -----------------------------------------------------------
-        
-        # Projections linéaires des nœuds (O(N))
-        q = self.W_q(x) # [N, H]
-        k = self.W_k(x) # [N, H]
-        v = self.W_v(x) # [N, H]
+        N = x.size(0)
 
-        # Calcul des scores d'attention Q * K^T uniquement sur les arêtes existantes.
-        # SDDMM : Sampled Dense-Dense Matrix Multiplication.
-        # A_sparse = sddmm(adj, Q, K) effectue A[i,j] = Q[i] @ K[j] pour (i,j) dans adj.
-        # Résultat : une SparseMatrix avec la même structure que adj.
-        attn_score_mat = dglsp.sddmm(adj, q, k.transpose(0, 1)) # O(|E|)
-        
-        # Mise à l'échelle
-        attn_score_mat = attn_score_mat.power(self.scale) # (val * scale)
+        # -----------------------------------------------------------
+        # 0. Conversion PyG edge_index -> DGL SparseMatrix
+        # -----------------------------------------------------------
+        # PyG edge_index est [Source, Target].
+        # Pour faire A @ V (agrégation), on veut que A[i, j] soit le poids de j->i.
+        # Donc Row = Target, Col = Source.
+        # On inverse les indices pour créer la matrice d'adjacence transposée.
+        indices = torch.stack([edge_index[1], edge_index[0]])
+        adj = dglsp.spmatrix(indices, shape=(N, N))
 
-        # Ajout du biais d'arête (Edge Bias) au score d'attention
+        # -----------------------------------------------------------
+        # 1. Calcul de l'Attention
+        # -----------------------------------------------------------
+        q = self.W_q(x)
+        k = self.W_k(x)
+        v = self.W_v(x)
+
+        # SDDMM : Calcule (Q_i * K_j) pour chaque arête (Row=Target i, Col=Source j)
+        attn_score_mat = dglsp.sddmm(adj, q, k) # Note: k (et pas k.T) car sddmm gère les dims
+        attn_score_mat = attn_score_mat.power(self.scale)
+
         if self.edge_bias:
-            # On récupère les valeurs brutes de la matrice sparse
-            # attn_score_mat.val est de taille [E] (ou [E, 1] selon les versions)
             e_bias = self.W_e(edge_attr).view(-1)
-            # On modifie directement les valeurs de la matrice sparse
-            # Note: dgl.sparse permet des opérations élémentaires directement
-            # Mais ici on veut additionner un vecteur externe aux valeurs de la matrice
-            # On crée une matrice sparse temporaire pour le biais ou on update .val
+            # Mise à jour des valeurs de la matrice sparse
             new_val = attn_score_mat.val + e_bias
             attn_score_mat = dglsp.val_like(attn_score_mat, new_val)
 
-        # Softmax Sparse : normalise les scores sur la dimension des voisins (dim=1 en général pour source->target)
         attn_weights = attn_score_mat.softmax(dim=1)
         
-        # Dropout sur les poids d'attention (opère sur .val)
         if self.training and self.attn_dropout.p > 0:
             attn_weights = dglsp.val_like(attn_weights, self.attn_dropout(attn_weights.val))
 
         # -----------------------------------------------------------
-        # 2. Agrégation & Node Update (Node First)
+        # 2. Agrégation & Node Update
         # -----------------------------------------------------------
-        
-        # SpMM : Sparse-Dense Matrix Multiplication
-        # Out = Attn_Matrix @ V
-        # Calcule la somme pondérée des valeurs des voisins.
-        aggr_out = dglsp.spmm(attn_weights, v) # O(|E|) -> Résultat [N, H]
+        # SpMM : Somme pondérée des valeurs des voisins (Source j -> Target i)
+        aggr_out = dglsp.spmm(attn_weights, v)
 
-        # Node Update (Residual)
         node_input = torch.cat([x, aggr_out], dim=-1)
         x_new = x + self.node_block(node_input)
 
         # -----------------------------------------------------------
-        # 3. Edge Update (Après Node Update)
+        # 3. Edge Update
         # -----------------------------------------------------------
+        # Ici on utilise edge_index original (PyG) pour récupérer les nœuds
+        row, col = edge_index # row=Source, col=Target
         
-        # Pour mettre à jour les arêtes, on a besoin des features des nœuds connectés.
-        # Dans dgl.sparse, on récupère les indices row (src) et col (dst).
-        # Note: Vérifiez l'ordre row/col selon si votre adj est en format COO source->target ou l'inverse.
-        # DGL convention: adj[row, col] -> row est souvent source, col est target (ou inverse selon transpose).
-        # On assume ici row=source, col=target (standard COO).
-        
-        rows = adj.row
-        cols = adj.col
-        
-        # On récupère les NOUVEAUX états des nœuds
-        x_src_new = x_new[rows] # [E, H]
-        x_dst_new = x_new[cols] # [E, H]
+        x_src_new = x_new[row]
+        x_dst_new = x_new[col]
 
-        # Edge Update (Residual)
         edge_input = torch.cat([edge_attr, x_src_new, x_dst_new], dim=-1)
         edge_attr_new = edge_attr + self.edge_block(edge_input)
 
