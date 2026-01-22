@@ -74,7 +74,9 @@ class LightningModule(L.LightningModule):
 
         self.model = get_simulator(param=parameters, model=processor, device=device)
 
-        self.loss = L2Loss(cv_weight=0.05)
+        self.train_loss = L2Loss(cv_weight=0.05)
+
+        self.val_loss = L2Loss()
 
         self.loss_masks = masks
 
@@ -114,7 +116,7 @@ class LightningModule(L.LightningModule):
         node_type = batch.x[:, self.model.node_type_index]
         network_output, target_delta_normalized, _, cv_terms = self.model(batch)
 
-        loss = self.loss(
+        loss = self.train_loss(
             target=target_delta_normalized,
             network_output=network_output,
             node_type=node_type,
@@ -232,7 +234,7 @@ class LightningModule(L.LightningModule):
 
         self.val_step_outputs.append(predicted_outputs.cpu())
         self.val_step_targets.append(target.cpu())
-        val_loss = self.loss(
+        val_loss = self.val_loss(
             target=predicted_outputs,
             network_output=predicted_outputs,
             node_type=node_type,
