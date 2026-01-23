@@ -11,10 +11,17 @@ from torch_geometric.data import Data
 #     SparseEdgeAttentionBlock,
 #     build_mlp,
 # )
+
+# from graphphysics.models.layers import (
+#     SparseNodeAttentionBlock,
+#     build_mlp,
+# )
+
 from graphphysics.models.layers import (
-    SparseNodeAttentionBlock,
+    KimiSpatialBlock,
     build_mlp,
 )
+
 
 class EncodeProcessDecode(nn.Module):
     """
@@ -81,10 +88,20 @@ class EncodeProcessDecode(nn.Module):
         #     [SparseEdgeAttentionBlock(hidden_size=hidden_size) for _ in range(message_passing_num)]
         # )
         
+        # self.processor_list = nn.ModuleList(
+        #     [SparseNodeAttentionBlock(hidden_size=hidden_size) for _ in range(message_passing_num)]
+        # )
+
         self.processor_list = nn.ModuleList(
-            [SparseNodeAttentionBlock(hidden_size=hidden_size) for _ in range(message_passing_num)]
+            [
+                KimiSpatialBlock(
+                    hidden_size=hidden_size, 
+                    chunk_size=32,       # Tu peux tuner ça (32 ou 64)
+                    bidirectional=True   # Important pour un graphe spatial
+                ) 
+                for _ in range(message_passing_num)
+            ]
         )
-    
 
 
     def forward(self, graph: Data) -> torch.Tensor:

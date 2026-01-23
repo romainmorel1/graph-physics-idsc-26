@@ -3,6 +3,8 @@ from typing import Any, Dict, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+
 from torch_geometric.nn import MessagePassing
 from torch_geometric.utils import softmax
 
@@ -664,3 +666,382 @@ class SparseNodeAttentionBlock(nn.Module):
         edge_attr_new = edge_attr + self.edge_block(edge_input)
 
         return x_new, edge_attr_new
+    
+
+# -------------------------------------------------------------------------
+# 1. Core Logic : Kimi Delta Attention (RNN Scan)
+# -------------------------------------------------------------------------
+class KimiDeltaAttention(nn.Module):
+    def __init__(
+        self, 
+        hidden_size: int, 
+        num_heads: int = 4, 
+        head_dim: int = 64, 
+        chunk_size: int = 32,
+        use_short_conv: bool = True
+    ):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.chunk_size = chunk_size
+        self.v_dim = num_heads * head_dim
+        self.use_short_conv = use_short_conv
+        
+        # 1. Linear Projections
+        self.q_proj = nn.Linear(hidden_size, self.v_dim, bias=False)
+        self.k_proj = nn.Linear(hidden_size, self.v_dim, bias=False)
+        self.v_proj = nn.Linear(hidden_size, self.v_dim, bias=False)
+        
+        # 2. Short Convolution (Depthwise 1D Conv)
+        # Le papier utilise kernel_size=3 pour capturer le contexte local
+        if self.use_short_conv:
+            self.conv_q = nn.Conv1d(self.v_dim, self.v_dim, kernel_size=3, padding=1, groups=self.v_dim)
+            self.conv_k = nn.Conv1d(self.v_dim, self.v_dim, kernel_size=3, padding=1, groups=self.v_dim)
+            self.conv_v = nn.Conv1d(self.v_dim, self.v_dim, kernel_size=3, padding=1, groups=self.v_dim)
+
+        # 3. Gate Projection (Log-space decay)
+        self.g_proj = nn.Linear(hidden_size, self.v_dim, bias=True)
+
+        # 4. Output
+        self.out_norm = RMSNorm(self.v_dim)
+        self.out_proj = nn.Linear(self.v_dim, hidden_size, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: [Batch, Seq_Len, Hidden]
+        """
+        B, L, _ = x.shape
+        H = self.num_heads
+        D = self.head_dim
+        
+        # --- A. Projections ---
+        # [B, L, V_dim]
+        q = self.q_proj(x)
+        k = self.k_proj(x)
+        v = self.v_proj(x)
+        
+        # --- B. ShortConv + Swish (SiLU) ---
+        # Conv1d attend [Batch, Channel, Length], donc on transpose
+        if self.use_short_conv:
+            q = q.transpose(1, 2) # [B, V_dim, L]
+            k = k.transpose(1, 2)
+            v = v.transpose(1, 2)
+            
+            # Application Conv + Swish (SiLU) comme dans le papier
+            q = F.silu(self.conv_q(q)).transpose(1, 2) # Retour en [B, L, V_dim]
+            k = F.silu(self.conv_k(k)).transpose(1, 2)
+            v = F.silu(self.conv_v(v)).transpose(1, 2)
+        else:
+            # Même sans conv, le Swish est appliqué
+            q = F.silu(q)
+            k = F.silu(k)
+            v = F.silu(v)
+
+        # --- C. Reshape & L2 Norm ---
+        q = q.view(B, L, H, D).transpose(1, 2) # [B, H, L, D]
+        k = k.view(B, L, H, D).transpose(1, 2)
+        v = v.view(B, L, H, D).transpose(1, 2)
+
+        # L2 Norm pour Q et K (Eigenvalue stability)
+        q = F.normalize(q, p=2, dim=-1)
+        k = F.normalize(k, p=2, dim=-1)
+        
+        # --- D. Gate (Decay) ---
+        # g = LogSigmoid(Linear(x))
+        # Note: on pourrait aussi mettre une ShortConv sur g si on voulait être puriste, 
+        # mais le papier insiste surtout sur q,k,v.
+        g = F.logsigmoid(self.g_proj(x)).view(B, L, H, D).transpose(1, 2)
+        
+        # --- E. Fast Chunk Kernel ---
+        out = chunk_kimi_kda(q, k, v, g, chunk_size=self.chunk_size)
+        
+        # --- F. Output ---
+        out = out.reshape(B, L, -1) # Flatten Heads
+        out = self.out_norm(out)
+        
+        return self.out_proj(out)
+
+# -------------------------------------------------------------------------
+# 2. Wrapper compatible avec Processor (Node + Edge Update)
+# -------------------------------------------------------------------------
+class KimiSpatialBlock(nn.Module):
+    """
+    Bloc Spatial utilisant Kimi Linear Attention.
+    Remplace SparseNodeAttentionBlock.
+    
+    Particularité : Traite le graphe comme une séquence globale.
+    Bidirectionnel : Scan Forward + Scan Backward pour capturer tout le contexte spatial.
+    """
+    def __init__(self, hidden_size, bidirectional=True, **kwargs):
+        super().__init__()
+        self.bidirectional = bidirectional
+        
+        # Le coeur : Kimi Attention
+        self.kimi_layer = KimiDeltaAttention(hidden_size, **kwargs)
+        
+        # Node Update MLP
+        self.node_block = build_mlp(
+            in_size=2 * hidden_size, # [x_old, x_kimi_out]
+            hidden_size=hidden_size,
+            out_size=hidden_size
+        )
+
+        # Edge Update MLP (Standard residuel)
+        self.edge_block = build_mlp(
+            in_size=3 * hidden_size,
+            hidden_size=hidden_size,
+            out_size=hidden_size
+        )
+
+    def forward(self, x, edge_index, edge_attr):
+        # x: [N, H] -> On reshape en [1, N, H] pour le traiter comme une séquence
+        # (On suppose ici 1 graphe par forward, ou Batch PyG concaténé)
+        x_seq = x.unsqueeze(0) 
+
+        # 1. Forward Scan
+        out_fwd = self.kimi_layer(x_seq) # [1, N, H]
+
+        if self.bidirectional:
+            # 2. Backward Scan (Flip sequence, apply Kimi, Flip back)
+            x_bwd = torch.flip(x_seq, dims=[1])
+            out_bwd = self.kimi_layer(x_bwd)
+            out_bwd = torch.flip(out_bwd, dims=[1])
+            
+            # Combine (Somme ou Moyenne)
+            out_kimi = out_fwd + out_bwd
+        else:
+            out_kimi = out_fwd
+
+        # Retour en format node [N, H]
+        out_kimi = out_kimi.squeeze(0)
+
+        # 3. Node Update (Residual)
+        node_in = torch.cat([x, out_kimi], dim=-1)
+        x_new = x + self.node_block(node_in)
+
+        # 4. Edge Update (Utilise les nouveaux noeuds)
+        row, col = edge_index
+        x_src = x_new[row]
+        x_dst = x_new[col]
+        
+        edge_in = torch.cat([edge_attr, x_src, x_dst], dim=-1)
+        edge_attr_new = edge_attr + self.edge_block(edge_in)
+
+        return x_new, edge_attr_new
+    
+    
+def chunk_kimi_kda(q, k, v, g, chunk_size=64, initial_state=None):
+    """
+    Implémentation Chunk-wise de Kimi Delta Attention (KDA).
+    Correspond au Listing 8b du papier technique.
+    
+    Args:
+        q, k, v: [Batch, Heads, Seq_Len, Head_Dim]
+        g: Log-space decay (log(alpha)). [Batch, Heads, Seq_Len, Head_Dim]
+        chunk_size: Taille du bloc (BT).
+    
+    Returns:
+        o: Output [Batch, Heads, Seq_Len, Head_Dim]
+    """
+    B, H, T, D = q.shape
+    BT = chunk_size
+    
+    # Padding si T n'est pas divisible par BT
+    if T % BT != 0:
+        pad_len = BT - (T % BT)
+        q = F.pad(q, (0, 0, 0, pad_len))
+        k = F.pad(k, (0, 0, 0, pad_len))
+        v = F.pad(v, (0, 0, 0, pad_len))
+        g = F.pad(g, (0, 0, 0, pad_len))
+    
+    # 1. Chunking: [B, H, Num_Chunks, BT, D]
+    # On utilise view/permute pour remplacer einops 'b h (n c) d -> b h n c d'
+    q = q.view(B, H, -1, BT, D)
+    k = k.view(B, H, -1, BT, D)
+    v = v.view(B, H, -1, BT, D)
+    g = g.view(B, H, -1, BT, D)
+    
+    NT = q.shape[2] # Nombre de chunks
+
+    # 2. Intra-Chunk Computation (Parallel)
+    # CumSum du decay en log-space
+    gc = g.cumsum(dim=-2) # Somme sur la dimension temporelle du chunk (BT)
+    
+    # Préparation des matrices d'interaction locale
+    # On doit calculer Aqk et Akk pour chaque chunk
+    # C'est du broadcast [..., BT, 1, D] * [..., 1, BT, D] -> [..., BT, BT, D] -> sum(-1) -> [..., BT, BT]
+    
+    # Astuce: Pour éviter de stocker [NT, BT, BT] qui est lourd, on le fait à la volée ou vectorisé.
+    # Ici, implémentation vectorisée pour la clarté.
+    
+    # Masque causal local (i >= j)
+    mask_causal = torch.tril(torch.ones(BT, BT, device=q.device, dtype=torch.bool))
+    
+    # Termes de decay relatifs: exp(g_i - g_j)
+    # g: [..., BT, D] -> gc
+    # gc_i: [..., BT, 1, D], gc_j: [..., 1, BT, D]
+    # decay_matrix = (gc.unsqueeze(-2) - gc.unsqueeze(-3)).exp() # [..., BT, BT, D]
+    # Note: Le snippet original fait des boucles manuelles sur BT pour économiser la mémoire.
+    # Pour PyTorch, vectoriser est souvent mieux sauf si BT est grand.
+    # On va suivre la logique "Block-Parallel" du snippet mais vectorisée sur B et H.
+
+    # --- Phase A: Pré-calcul des matrices locales (Aqk, Akk) ---
+    # Pour respecter le snippet exactement, on itère sur i (colonnes du chunk)
+    # Mais vectoriser Aqk et Akk est plus rapide sur GPU moderne que la boucle Python.
+    
+    # Matrice des différences de gate: G[i, j] = gc[i] - gc[j]
+    # Attention: le snippet utilise g_i (cumulé) et g (cumulé).
+    # s1_i = (gc[i] - gc).exp() pour j <= i
+    
+    gc_i = gc.unsqueeze(-2) # [..., BT, 1, D]
+    gc_j = gc.unsqueeze(-3) # [..., 1, BT, D]
+    decay_rel = (gc_i - gc_j) # Log-diff
+    
+    # On masque les positions futures pour respecter la causalité
+    # mask: True si j > i (interdit)
+    mask_future = ~mask_causal
+    decay_rel = decay_rel.masked_fill(mask_future.unsqueeze(-1), -float('inf'))
+    decay_term = decay_rel.exp() # [..., BT, BT, D]
+
+    # Aqk[i, j] = sum_d (q[i,d] * k[j,d] * decay[i,j,d])
+    # [..., BT, 1, D] * [..., 1, BT, D] * [..., BT, BT, D] -> sum(-1)
+    Aqk = (q.unsqueeze(-2) * k.unsqueeze(-3) * decay_term).sum(dim=-1) # [B, H, NT, BT, BT]
+    
+    # Akk[i, j] = sum_d (k[i,d] * k[j,d] * decay[i,j,d]) (Pour le terme delta)
+    # Note: Dans le snippet, s2_i utilise (gc - g_i).exp(). C'est l'inverse ?
+    # Vérif Listing 8b line 12: s2_i = (gc - g_i).exp(). 
+    # Ah, c'est pour la construction de la matrice d'inversion.
+    
+    # Recalcul précis de Akk pour l'inversion (Listing 8b lines 10-12)
+    # Le snippet fait une boucle. Reproduisons la boucle pour l'exactitude mathématique.
+    # C'est la partie critique "Inverse Iterative".
+    
+    A = torch.zeros(B, H, NT, BT, BT, device=q.device, dtype=q.dtype)
+    
+    # On calcule Akk "spécial" pour l'inversion M
+    # Akk[i,j] (masked) = k_i * k_j * exp(gc_j - gc_i)  <-- Attention au sens
+    # Le snippet ligne 16: A = -Akk
+    
+    # Version vectorisée de la boucle lines 8-13 du snippet :
+    # s2_i = (gc - g_i).exp() -> decay "futur" local
+    # Akk[..., i] = (k_i * k * s2_i).sum(-1)
+    # Cela remplit la colonne i.
+    
+    # Pour vectoriser proprement la construction de A (Matrice de transition) :
+    # A_base[j, i] = - (k[j] * k[i] * exp(gc[j] - gc[i])).sum() pour j > i
+    # C'est une Strict Lower Triangular.
+    
+    decay_inv = (gc_j - gc_i).exp() # exp(gc[j] - gc[i])
+    A_base = -(k.unsqueeze(-2) * k.unsqueeze(-3) * decay_inv).sum(dim=-1)
+    
+    # On ne garde que la partie Strict Lower (j > i selon les indices du snippet, ou j < i ?)
+    # Snippet ligne 14: mask = triu(diagonal=0). A = -Akk.masked_fill(mask, 0)
+    # Donc on garde la partie STRICT LOWER.
+    A = A_base.tril(-1) # Strict lower part
+    
+    # --- Phase B: Inversion Itérative (Le "Forward Substitution") ---
+    # C'est la ligne 15-16 du snippet : A[..., i, :i] += ...
+    # C'est O(BT) séquentiel. Sur BT=64, c'est acceptable.
+    for i in range(1, BT):
+        # A[..., i, :i] += (A[..., i, :, None] * A[..., :, :i]).sum(-2)
+        # On met à jour la ligne i en utilisant les lignes précédentes.
+        # Vectorisation sur B, H, NT
+        row_i = A[..., i, :i] # [..., i]
+        # Produit scalaire "batché" des termes précédents
+        # A[..., i, :i] est [..., 1, i] (une partie de ligne)
+        # A[..., :i, :i] est le bloc carré déjà calculé
+        # Le snippet est subtil. Il fait:
+        # A[i, :i] = A[i, :i] + sum_k (A[i, k] * A[k, :i])
+        
+        # Slice views
+        # A_prev: [B, H, NT, i, i]
+        # A_curr_row_part: [B, H, NT, i] -> A[..., i, :i]
+        
+        # update = A[..., i, :i].unsqueeze(-2) @ A[..., :i, :i]
+        # Non, la boucle snippet est: A[i, :i] += (A[i, :, None] * A[:, :i]).sum(-2)
+        # Mais le mask triu a mis des 0.
+        # C'est une résolution de système triangulaire.
+        # Faisons-le simplement :
+        vec = A[..., i, :i].clone()
+        mat = A[..., :i, :i]
+        # update = vec @ mat
+        update = torch.matmul(vec.unsqueeze(-2), mat).squeeze(-2)
+        A[..., i, :i] = vec + update
+
+    # A devient (I + Lower)^-1. On ajoute I.
+    A = A + torch.eye(BT, device=q.device)
+
+    # --- Phase C: Calcul de u et w (Auxiliary Vectors) ---
+    # w = A @ (exp(gc) * k)
+    # u = A @ v
+    
+    # exp(gc) * k
+    k_scaled = k * gc.exp()
+    
+    # Matmul [..., BT, BT] @ [..., BT, D]
+    w = torch.matmul(A, k_scaled)
+    u = torch.matmul(A, v)
+
+    # --- Phase D: Inter-Chunk Recurrence (Scan) ---
+    # S: [B, H, D, D]
+    if initial_state is None:
+        S = torch.zeros(B, H, D, D, device=q.device, dtype=q.dtype)
+    else:
+        S = initial_state
+
+    # Output container
+    o = torch.zeros_like(v)
+    
+    # Recurrence loop over NT chunks
+    for i in range(NT):
+        q_i = q[:, :, i] # [B, H, BT, D]
+        g_i = gc[:, :, i]
+        u_i = u[:, :, i]
+        w_i = w[:, :, i]
+        k_i = k[:, :, i]
+        v_i = v[:, :, i]
+        
+        # 1. Output intra-chunk (Partie venant de l'état passé S)
+        # o_recurrent = (q_i * exp(g_i)) @ S
+        term_S = torch.matmul(q_i * g_i.exp(), S)
+        
+        # 2. Output intra-chunk (Partie locale venant de Aqk)
+        # o_local = Aqk @ (u_i - w_i @ S)
+        # w_i @ S -> [..., BT, D] @ [..., D, D] -> [..., BT, D]
+        term_correction = u_i - torch.matmul(w_i, S)
+        
+        # Aqk pour ce chunk:
+        # Aqk_i = Aqk[:, :, i] # [..., BT, BT]
+        # Attention: Aqk calculé plus haut (Phase A) utilisait decay_term causal.
+        # C'est bien ce qu'il faut.
+        # term_local = Aqk_i @ term_correction
+        
+        # Note: Aqk n'a pas été stocké entièrement pour économiser la mémoire ? 
+        # Si NT est grand, stocker Aqk [NT, BT, BT] est OK (BT=64).
+        # On recalcul Aqk ici si on veut, ou on l'utilise.
+        # On l'a calculé ligne 66.
+        Aqk_i = Aqk[:, :, i]
+        term_local = torch.matmul(Aqk_i, term_correction)
+        
+        o[:, :, i] = term_S + term_local
+        
+        # 3. State Update pour le prochain chunk
+        # Decay total du chunk: exp(gc_last - gc)
+        # g_i_last: [..., 1, D] (Dernier token du chunk)
+        decay_chunk = (g_i[:, :, -1:, :] - g_i).exp()
+        
+        # S = S * exp(g_i_last)
+        S = S * g_i[:, :, -1, :].unsqueeze(-2).exp()
+        
+        # S += (k_i * decay).T @ v_i
+        # [..., BT, D].T @ [..., BT, D] -> [..., D, D]
+        # Attention aux dimensions batch [B, H, D, BT] @ [B, H, BT, D]
+        k_decayed = k_i * decay_chunk
+        S = S + torch.matmul(k_decayed.transpose(-1, -2), v_i)
+        
+    # Flatten structure
+    o = o.view(B, H, T, D)
+    if T != q.shape[2]*BT: # Si padding
+        o = o[:, :, :T, :]
+        
+    return o.permute(0, 2, 1, 3) # [B, T, H, D]
