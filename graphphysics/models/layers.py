@@ -833,20 +833,14 @@ class KimiSpatialBlock(nn.Module):
 def chunk_kimi_kda(q, k, v, g, chunk_size=64, initial_state=None):
     """
     Implémentation Chunk-wise de Kimi Delta Attention (KDA).
-    Correspond au Listing 8b du papier technique.
-    
-    Args:
-        q, k, v: [Batch, Heads, Seq_Len, Head_Dim]
-        g: Log-space decay (log(alpha)). [Batch, Heads, Seq_Len, Head_Dim]
-        chunk_size: Taille du bloc (BT).
-    
-    Returns:
-        o: Output [Batch, Heads, Seq_Len, Head_Dim]
+    Version corrigée pour gérer le padding correctement.
     """
     B, H, T, D = q.shape
     BT = chunk_size
     
-    # Padding si T n'est pas divisible par BT
+    # 1. Padding si T n'est pas divisible par BT
+    # On garde T_original en mémoire pour le slicing final
+    T_original = T
     if T % BT != 0:
         pad_len = BT - (T % BT)
         q = F.pad(q, (0, 0, 0, pad_len))
@@ -854,8 +848,7 @@ def chunk_kimi_kda(q, k, v, g, chunk_size=64, initial_state=None):
         v = F.pad(v, (0, 0, 0, pad_len))
         g = F.pad(g, (0, 0, 0, pad_len))
     
-    # 1. Chunking: [B, H, Num_Chunks, BT, D]
-    # On utilise view/permute pour remplacer einops 'b h (n c) d -> b h n c d'
+    # 2. Chunking: [B, H, Num_Chunks, BT, D]
     q = q.view(B, H, -1, BT, D)
     k = k.view(B, H, -1, BT, D)
     v = v.view(B, H, -1, BT, D)
@@ -863,185 +856,79 @@ def chunk_kimi_kda(q, k, v, g, chunk_size=64, initial_state=None):
     
     NT = q.shape[2] # Nombre de chunks
 
-    # 2. Intra-Chunk Computation (Parallel)
-    # CumSum du decay en log-space
-    gc = g.cumsum(dim=-2) # Somme sur la dimension temporelle du chunk (BT)
-    
-    # Préparation des matrices d'interaction locale
-    # On doit calculer Aqk et Akk pour chaque chunk
-    # C'est du broadcast [..., BT, 1, D] * [..., 1, BT, D] -> [..., BT, BT, D] -> sum(-1) -> [..., BT, BT]
-    
-    # Astuce: Pour éviter de stocker [NT, BT, BT] qui est lourd, on le fait à la volée ou vectorisé.
-    # Ici, implémentation vectorisée pour la clarté.
-    
-    # Masque causal local (i >= j)
-    mask_causal = torch.tril(torch.ones(BT, BT, device=q.device, dtype=torch.bool))
-    
-    # Termes de decay relatifs: exp(g_i - g_j)
-    # g: [..., BT, D] -> gc
-    # gc_i: [..., BT, 1, D], gc_j: [..., 1, BT, D]
-    # decay_matrix = (gc.unsqueeze(-2) - gc.unsqueeze(-3)).exp() # [..., BT, BT, D]
-    # Note: Le snippet original fait des boucles manuelles sur BT pour économiser la mémoire.
-    # Pour PyTorch, vectoriser est souvent mieux sauf si BT est grand.
-    # On va suivre la logique "Block-Parallel" du snippet mais vectorisée sur B et H.
-
     # --- Phase A: Pré-calcul des matrices locales (Aqk, Akk) ---
-    # Pour respecter le snippet exactement, on itère sur i (colonnes du chunk)
-    # Mais vectoriser Aqk et Akk est plus rapide sur GPU moderne que la boucle Python.
-    
-    # Matrice des différences de gate: G[i, j] = gc[i] - gc[j]
-    # Attention: le snippet utilise g_i (cumulé) et g (cumulé).
-    # s1_i = (gc[i] - gc).exp() pour j <= i
+    gc = g.cumsum(dim=-2) 
     
     gc_i = gc.unsqueeze(-2) # [..., BT, 1, D]
     gc_j = gc.unsqueeze(-3) # [..., 1, BT, D]
-    decay_rel = (gc_i - gc_j) # Log-diff
+    decay_rel = (gc_i - gc_j)
     
-    # On masque les positions futures pour respecter la causalité
-    # mask: True si j > i (interdit)
+    mask_causal = torch.tril(torch.ones(BT, BT, device=q.device, dtype=torch.bool))
     mask_future = ~mask_causal
     decay_rel = decay_rel.masked_fill(mask_future.unsqueeze(-1), -float('inf'))
-    decay_term = decay_rel.exp() # [..., BT, BT, D]
+    decay_term = decay_rel.exp()
 
-    # Aqk[i, j] = sum_d (q[i,d] * k[j,d] * decay[i,j,d])
-    # [..., BT, 1, D] * [..., 1, BT, D] * [..., BT, BT, D] -> sum(-1)
-    Aqk = (q.unsqueeze(-2) * k.unsqueeze(-3) * decay_term).sum(dim=-1) # [B, H, NT, BT, BT]
+    Aqk = (q.unsqueeze(-2) * k.unsqueeze(-3) * decay_term).sum(dim=-1)
     
-    # Akk[i, j] = sum_d (k[i,d] * k[j,d] * decay[i,j,d]) (Pour le terme delta)
-    # Note: Dans le snippet, s2_i utilise (gc - g_i).exp(). C'est l'inverse ?
-    # Vérif Listing 8b line 12: s2_i = (gc - g_i).exp(). 
-    # Ah, c'est pour la construction de la matrice d'inversion.
-    
-    # Recalcul précis de Akk pour l'inversion (Listing 8b lines 10-12)
-    # Le snippet fait une boucle. Reproduisons la boucle pour l'exactitude mathématique.
-    # C'est la partie critique "Inverse Iterative".
-    
-    A = torch.zeros(B, H, NT, BT, BT, device=q.device, dtype=q.dtype)
-    
-    # On calcule Akk "spécial" pour l'inversion M
-    # Akk[i,j] (masked) = k_i * k_j * exp(gc_j - gc_i)  <-- Attention au sens
-    # Le snippet ligne 16: A = -Akk
-    
-    # Version vectorisée de la boucle lines 8-13 du snippet :
-    # s2_i = (gc - g_i).exp() -> decay "futur" local
-    # Akk[..., i] = (k_i * k * s2_i).sum(-1)
-    # Cela remplit la colonne i.
-    
-    # Pour vectoriser proprement la construction de A (Matrice de transition) :
-    # A_base[j, i] = - (k[j] * k[i] * exp(gc[j] - gc[i])).sum() pour j > i
-    # C'est une Strict Lower Triangular.
-    
-    decay_inv = (gc_j - gc_i).exp() # exp(gc[j] - gc[i])
+    decay_inv = (gc_j - gc_i).exp()
     A_base = -(k.unsqueeze(-2) * k.unsqueeze(-3) * decay_inv).sum(dim=-1)
+    A = A_base.tril(-1)
     
-    # On ne garde que la partie Strict Lower (j > i selon les indices du snippet, ou j < i ?)
-    # Snippet ligne 14: mask = triu(diagonal=0). A = -Akk.masked_fill(mask, 0)
-    # Donc on garde la partie STRICT LOWER.
-    A = A_base.tril(-1) # Strict lower part
-    
-    # --- Phase B: Inversion Itérative (Le "Forward Substitution") ---
-    # C'est la ligne 15-16 du snippet : A[..., i, :i] += ...
-    # C'est O(BT) séquentiel. Sur BT=64, c'est acceptable.
+    # --- Phase B: Inversion Itérative ---
     for i in range(1, BT):
-        # A[..., i, :i] += (A[..., i, :, None] * A[..., :, :i]).sum(-2)
-        # On met à jour la ligne i en utilisant les lignes précédentes.
-        # Vectorisation sur B, H, NT
-        row_i = A[..., i, :i] # [..., i]
-        # Produit scalaire "batché" des termes précédents
-        # A[..., i, :i] est [..., 1, i] (une partie de ligne)
-        # A[..., :i, :i] est le bloc carré déjà calculé
-        # Le snippet est subtil. Il fait:
-        # A[i, :i] = A[i, :i] + sum_k (A[i, k] * A[k, :i])
-        
-        # Slice views
-        # A_prev: [B, H, NT, i, i]
-        # A_curr_row_part: [B, H, NT, i] -> A[..., i, :i]
-        
-        # update = A[..., i, :i].unsqueeze(-2) @ A[..., :i, :i]
-        # Non, la boucle snippet est: A[i, :i] += (A[i, :, None] * A[:, :i]).sum(-2)
-        # Mais le mask triu a mis des 0.
-        # C'est une résolution de système triangulaire.
-        # Faisons-le simplement :
         vec = A[..., i, :i].clone()
         mat = A[..., :i, :i]
-        # update = vec @ mat
         update = torch.matmul(vec.unsqueeze(-2), mat).squeeze(-2)
         A[..., i, :i] = vec + update
 
-    # A devient (I + Lower)^-1. On ajoute I.
     A = A + torch.eye(BT, device=q.device)
 
-    # --- Phase C: Calcul de u et w (Auxiliary Vectors) ---
-    # w = A @ (exp(gc) * k)
-    # u = A @ v
-    
-    # exp(gc) * k
+    # --- Phase C: Calcul de u et w ---
     k_scaled = k * gc.exp()
-    
-    # Matmul [..., BT, BT] @ [..., BT, D]
     w = torch.matmul(A, k_scaled)
     u = torch.matmul(A, v)
 
     # --- Phase D: Inter-Chunk Recurrence (Scan) ---
-    # S: [B, H, D, D]
     if initial_state is None:
         S = torch.zeros(B, H, D, D, device=q.device, dtype=q.dtype)
     else:
         S = initial_state
 
-    # Output container
+    # On prépare le tenseur de sortie directement avec la forme "Chunkée"
+    # o shape: [B, H, NT, BT, D]
     o = torch.zeros_like(v)
     
-    # Recurrence loop over NT chunks
     for i in range(NT):
-        q_i = q[:, :, i] # [B, H, BT, D]
+        q_i = q[:, :, i]
         g_i = gc[:, :, i]
         u_i = u[:, :, i]
         w_i = w[:, :, i]
         k_i = k[:, :, i]
         v_i = v[:, :, i]
         
-        # 1. Output intra-chunk (Partie venant de l'état passé S)
-        # o_recurrent = (q_i * exp(g_i)) @ S
         term_S = torch.matmul(q_i * g_i.exp(), S)
-        
-        # 2. Output intra-chunk (Partie locale venant de Aqk)
-        # o_local = Aqk @ (u_i - w_i @ S)
-        # w_i @ S -> [..., BT, D] @ [..., D, D] -> [..., BT, D]
         term_correction = u_i - torch.matmul(w_i, S)
         
-        # Aqk pour ce chunk:
-        # Aqk_i = Aqk[:, :, i] # [..., BT, BT]
-        # Attention: Aqk calculé plus haut (Phase A) utilisait decay_term causal.
-        # C'est bien ce qu'il faut.
-        # term_local = Aqk_i @ term_correction
-        
-        # Note: Aqk n'a pas été stocké entièrement pour économiser la mémoire ? 
-        # Si NT est grand, stocker Aqk [NT, BT, BT] est OK (BT=64).
-        # On recalcul Aqk ici si on veut, ou on l'utilise.
-        # On l'a calculé ligne 66.
+        # On recalcule ou récupère Aqk du chunk i
         Aqk_i = Aqk[:, :, i]
         term_local = torch.matmul(Aqk_i, term_correction)
         
         o[:, :, i] = term_S + term_local
         
-        # 3. State Update pour le prochain chunk
-        # Decay total du chunk: exp(gc_last - gc)
-        # g_i_last: [..., 1, D] (Dernier token du chunk)
+        # State Update
         decay_chunk = (g_i[:, :, -1:, :] - g_i).exp()
-        
-        # S = S * exp(g_i_last)
         S = S * g_i[:, :, -1, :].unsqueeze(-2).exp()
         
-        # S += (k_i * decay).T @ v_i
-        # [..., BT, D].T @ [..., BT, D] -> [..., D, D]
-        # Attention aux dimensions batch [B, H, D, BT] @ [B, H, BT, D]
         k_decayed = k_i * decay_chunk
         S = S + torch.matmul(k_decayed.transpose(-1, -2), v_i)
         
-    # Flatten structure
-    o = o.view(B, H, T, D)
-    if T != q.shape[2]*BT: # Si padding
-        o = o[:, :, :T, :]
+    # --- FINALE CORRIGÉE ---
+    
+    # 1. On aplatit les chunks: [B, H, NT*BT, D] -> [B, H, T_padded, D]
+    o = o.view(B, H, -1, D)
+    
+    # 2. On coupe le padding pour revenir à T_original
+    if o.shape[2] != T_original:
+        o = o[:, :, :T_original, :]
         
     return o.permute(0, 2, 1, 3) # [B, T, H, D]

@@ -94,11 +94,12 @@ class EncodeProcessDecode(nn.Module):
 
         self.processor_list = nn.ModuleList(
             [
-                KimiSpatialBlock(
-                    hidden_size=hidden_size, 
-                    chunk_size=32,       # Tu peux tuner ça (32 ou 64)
-                    bidirectional=True   # Important pour un graphe spatial
-                ) 
+        KimiSpatialBlock(
+        hidden_size=hidden_size, 
+        chunk_size=32, 
+        bidirectional=True,
+        head_dim=16 # Réduire ceci si vous voulez moins de paramètres (défaut=64)
+)
                 for _ in range(message_passing_num)
             ]
         )
